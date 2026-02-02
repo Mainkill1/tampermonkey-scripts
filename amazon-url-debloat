@@ -1,6 +1,7 @@
 // ==UserScript==
 // @name         Debloat Amazon URLs
 // @namespace    https://tampermonkey.net/
+// @author       Mainkill1
 // @version      1.1
 // @description  Remove tracking/bloat from Amazon product URLs and page address bar
 // @match        https://www.amazon.com/*
