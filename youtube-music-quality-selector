@@ -1,0 +1,690 @@
+// ==UserScript==
+// @name         YouTube Music – Quality Settings
+// @author       Mainkill1
+// @namespace    ytmusic-hd-toggle
+// @description  Youtube Music quality toggle with Auto Size quality selection
+// @version      1.4.1
+// @match        https://music.youtube.com/*
+// @run-at       document-idle
+// @grant        unsafeWindow
+// ==/UserScript==
+
+(() => {
+  const VERSION = "1.4.1";
+  const PREFIX = "[YT Music HD]";
+
+  // Prep for extension conversion: use window when unsafeWindow is not present.
+  const W = (typeof unsafeWindow !== "undefined" && unsafeWindow) ? unsafeWindow : window;
+  const D = W.document;
+
+  console.log(`${PREFIX} script loaded v${VERSION}`);
+
+  /* ================== colors ================== */
+
+  const COLOR_GRAY = "var(--yt-spec-text-primary)";
+  const COLOR_RED = "#ff4e45"; // Auto Best
+  const COLOR_GREEN = "#3ddc84"; // Auto Sized
+  const COLOR_BLUE = "#4fa3ff"; // Fixed
+
+  /* ================== menu text ================== */
+
+  const MENU_FONT_FAMILY =
+    'Roboto, "YouTube Sans", system-ui, -apple-system, BlinkMacSystemFont';
+  const MENU_FONT_SIZE = "14px";
+  const MENU_LINE_HEIGHT = "20px";
+  const MENU_TEXT_ACTIVE = "#ffffff";
+  const MENU_TEXT_INACTIVE = "rgba(255,255,255,.75)";
+  const MENU_ACTIVE_BAR = "#ffffff";
+
+  /* ================== persistence ================== */
+
+  const STORAGE_KEY = "tm-hd-toggle-state-v2";
+
+  /* ================== support / fallback ================== */
+
+  let isSupported = true;
+  let unsupportedReason = "";
+  let unsupportedLogged = false;
+
+  function detectSupport(player) {
+    if (!player) return { ok: false, reason: "player_not_found" };
+
+    const canSet =
+      typeof player.setPlaybackQualityRange === "function" ||
+      typeof player.setPlaybackQuality === "function";
+
+    const canList =
+      typeof player.getAvailableQualityData === "function" ||
+      (typeof player.getAvailableQualityDataAndMessaging === "function" &&
+       !!player.getAvailableQualityDataAndMessaging?.()?.qualityData);
+
+    if (!canSet) return { ok: false, reason: "missing_setPlaybackQuality" };
+    if (!canList) return { ok: false, reason: "missing_getAvailableQualityData" };
+
+    return { ok: true, reason: "" };
+  }
+
+  function refreshSupport(player, context) {
+    const s = detectSupport(player);
+    isSupported = s.ok;
+    unsupportedReason = s.reason;
+
+    if (!isSupported && !unsupportedLogged) {
+      unsupportedLogged = true;
+      console.warn(`${PREFIX} Extension no longer supported.`, {
+        reason: unsupportedReason,
+        context,
+        version: VERSION
+      });
+    }
+  }
+
+  /* ================== state ================== */
+
+  let mode = "auto"; // auto | autoBest | autoSized | fixed
+  let fixedQuality = null; // the user-selected quality token (e.g., "hd1080")
+  let fixedResolution = 0; // parsed from qualityLabel at selection time (e.g., 1080)
+
+  let hasInjectedUI = false;
+  let hasRestoredState = false;
+
+  // Debounced reapply bursts (finite, event-triggered)
+  let reapplyTimeouts = [];
+
+  // Hook bookkeeping
+  let playerEventsHooked = false;
+  let hookedVideoEl = null;
+  let resizeObserver = null;
+
+  // Guard to avoid event recursion
+  let isApplying = false;
+
+  /* ================== helpers ================== */
+
+  function getPlayer() {
+    return D.getElementById("movie_player");
+  }
+
+  function getPlayerBar() {
+    return D.querySelector("ytmusic-player-bar");
+  }
+
+  function tryCall(fn) {
+    try { return fn(); } catch { return undefined; }
+  }
+
+  function setQualityPinned(player, quality) {
+    if (!isSupported) return;
+    // Some builds ignore one of these calls; doing both is more reliable.
+    tryCall(() => player.setPlaybackQualityRange?.(quality, quality));
+    tryCall(() => player.setPlaybackQuality?.(quality));
+  }
+
+  function setAuto(player) {
+    if (!isSupported) return;
+    tryCall(() => player.setPlaybackQualityRange?.("auto", "auto"));
+    tryCall(() => player.setPlaybackQuality?.("auto"));
+  }
+
+  function clearReapplyTimeouts() {
+    if (!reapplyTimeouts.length) return;
+    for (const t of reapplyTimeouts) clearTimeout(t);
+    reapplyTimeouts = [];
+  }
+
+  function scheduleReapplyBurst(reason) {
+    if (!isSupported) return;
+
+    // Event-driven, finite retries to catch delayed quality list updates (no interval polling).
+    clearReapplyTimeouts();
+
+    const delays = [0, 250, 900, 1800];
+    for (const d of delays) {
+      reapplyTimeouts.push(setTimeout(() => reapplyQuality(reason), d));
+    }
+  }
+
+  /* ================== quality discovery ================== */
+
+  function getRawQualityData(player) {
+    if (!player) return [];
+    return (
+      player.getAvailableQualityData?.() ||
+      player.getAvailableQualityDataAndMessaging?.()?.qualityData ||
+      []
+    );
+  }
+
+  function getPlayableQualities(player) {
+    return getRawQualityData(player).filter(q => q && q.isPlayable);
+  }
+
+  function parseResolution(label) {
+    const n = parseInt(label, 10);
+    return Number.isFinite(n) ? n : 0;
+  }
+
+  function parseFps(label) {
+    return label && label.includes("60") ? 60 : 30;
+  }
+
+  function detectCodec(entry) {
+    const raw = [
+      entry?.mimeType,
+      entry?.codec,
+      entry?.codecs
+    ].filter(Boolean).join(" ").toLowerCase();
+
+    if (!raw) return null;
+    if (raw.includes("av01")) return "AV1";
+    if (raw.includes("vp09")) return "VP9";
+    if (raw.includes("avc1")) return "AVC";
+
+    return raw.split(/[ ,"]/)[0];
+  }
+
+  function sortQualities(list, direction = "desc") {
+    const dir = direction === "asc" ? 1 : -1;
+
+    return [...list].sort((a, b) => {
+      const ra = parseResolution(a.qualityLabel);
+      const rb = parseResolution(b.qualityLabel);
+      if (ra !== rb) return (ra - rb) * dir;
+
+      const fa = parseFps(a.qualityLabel);
+      const fb = parseFps(b.qualityLabel);
+      return (fa - fb) * dir;
+    });
+  }
+
+  function getBestQualityEntry(player) {
+    const list = sortQualities(
+      getPlayableQualities(player)
+        .filter(q => q.quality !== "auto")
+        .filter(q => parseResolution(q.qualityLabel) > 0),
+      "desc"
+    );
+    return list[0] || null;
+  }
+
+  function getAutoSizedEntry(player) {
+    const qualitiesAsc = sortQualities(
+      getPlayableQualities(player)
+        .filter(q => q.quality !== "auto")
+        .filter(q => parseResolution(q.qualityLabel) > 0),
+      "asc"
+    );
+    if (!qualitiesAsc.length) return null;
+
+    const size = tryCall(() => player.getPlayerSize?.());
+    const playerHeight = size?.height || 0;
+
+    if (!playerHeight) return qualitiesAsc[qualitiesAsc.length - 1];
+
+    const dpr = W.devicePixelRatio || 1;
+    const target = Math.ceil(playerHeight * dpr);
+
+    return (
+      qualitiesAsc.find(q => parseResolution(q.qualityLabel) >= target) ||
+      qualitiesAsc[qualitiesAsc.length - 1]
+    );
+  }
+
+  function resolveFixedQualityToEnforce(player) {
+    if (!fixedQuality) return null;
+
+    const playable = getPlayableQualities(player)
+      .filter(q => q.quality !== "auto")
+      .filter(q => parseResolution(q.qualityLabel) > 0);
+
+    if (!playable.length) return null;
+
+    const exact = playable.find(q => q.quality === fixedQuality);
+    if (exact) return exact.quality;
+
+    const desiredRes = fixedResolution || 0;
+    if (desiredRes > 0) {
+      const belowOrEqual = playable.filter(q => parseResolution(q.qualityLabel) <= desiredRes);
+      if (belowOrEqual.length) return sortQualities(belowOrEqual, "desc")[0].quality;
+      return sortQualities(playable, "asc")[0].quality;
+    }
+
+    return sortQualities(playable, "desc")[0].quality;
+  }
+
+  function getResolvedQualityLabel(player) {
+    const playable = getPlayableQualities(player)
+      .filter(q => q.quality !== "auto")
+      .filter(q => parseResolution(q.qualityLabel) > 0);
+
+    if (!playable.length) return null;
+
+    let token = null;
+
+    if (mode === "autoBest") token = getBestQualityEntry(player)?.quality || null;
+    else if (mode === "autoSized") token = getAutoSizedEntry(player)?.quality || null;
+    else if (mode === "fixed") token = resolveFixedQualityToEnforce(player);
+    else return null;
+
+    if (!token) return null;
+
+    const entry = playable.find(q => q.quality === token);
+    return entry?.qualityLabel || null;
+  }
+
+  /* ================== persistence ================== */
+
+  function saveState() {
+    try {
+      const payload = { mode, fixedQuality, fixedResolution };
+      W.localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+    } catch { /* ignore */ }
+  }
+
+  function restoreStateIfNeeded(player) {
+    if (hasRestoredState) return;
+    hasRestoredState = true;
+
+    let parsed = null;
+    try {
+      const raw = W.localStorage.getItem(STORAGE_KEY);
+      if (raw) parsed = JSON.parse(raw);
+    } catch {
+      parsed = null;
+    }
+    if (!parsed) return;
+
+    const restoredMode = parsed.mode;
+    if (restoredMode === "auto" || restoredMode === "autoBest" || restoredMode === "autoSized" || restoredMode === "fixed") {
+      mode = restoredMode;
+    } else {
+      mode = "auto";
+    }
+
+    fixedQuality = typeof parsed.fixedQuality === "string" ? parsed.fixedQuality : null;
+    fixedResolution = Number.isFinite(parsed.fixedResolution) ? parsed.fixedResolution : 0;
+
+    if (mode === "auto") setAuto(player);
+    else scheduleReapplyBurst("restore");
+  }
+
+  /* ================== mode application ================== */
+
+  function applyAuto(player) {
+    mode = "auto";
+    fixedQuality = null;
+    fixedResolution = 0;
+    saveState();
+    setAuto(player);
+  }
+
+  function applyAutoBest(player) {
+    mode = "autoBest";
+    fixedQuality = null;
+    fixedResolution = 0;
+    saveState();
+    scheduleReapplyBurst("applyAutoBest");
+  }
+
+  function applyAutoSized(player) {
+    mode = "autoSized";
+    fixedQuality = null;
+    fixedResolution = 0;
+    saveState();
+    scheduleReapplyBurst("applyAutoSized");
+  }
+
+  function applyFixed(player, entry) {
+    mode = "fixed";
+    fixedQuality = entry.quality;
+    fixedResolution = parseResolution(entry.qualityLabel) || 0;
+    saveState();
+    scheduleReapplyBurst("applyFixed");
+  }
+
+  function updateButtonColor(btn) {
+    btn.style.color =
+      mode === "auto"      ? COLOR_GRAY :
+      mode === "autoBest"  ? COLOR_RED :
+      mode === "autoSized" ? COLOR_GREEN :
+                             COLOR_BLUE;
+  }
+
+  function updateButtonTitle(btn, player) {
+    if (!isSupported) {
+      btn.title = "Extension no longer supported (see console)";
+      return;
+    }
+
+    const resolved = getResolvedQualityLabel(player);
+    btn.title =
+      mode === "auto" ? "Auto" :
+      mode === "autoBest" ? `Auto Best${resolved ? ` (${resolved})` : ""}` :
+      mode === "autoSized" ? `Auto Sized${resolved ? ` (${resolved})` : ""}` :
+      mode === "fixed" ? `Fixed${resolved ? ` (${resolved})` : ""}` :
+      "HD";
+  }
+
+  /* ================== active menu item ================== */
+
+  function isMenuItemActive(item) {
+    if (item.type === "auto") return mode === "auto";
+    if (item.type === "autoBest") return mode === "autoBest";
+    if (item.type === "autoSized") return mode === "autoSized";
+    if (item.type === "quality") return mode === "fixed" && fixedQuality === item.entry.quality;
+    return false;
+  }
+
+  /* ================== enforcement (event-driven) ================== */
+
+  function reapplyQuality(reason) {
+    if (!isSupported) return;
+    if (isApplying) return;
+
+    const player = getPlayer();
+    if (!player) return;
+
+    refreshSupport(player, `reapply:${reason}`);
+    if (!isSupported) return;
+
+    if (D.visibilityState && D.visibilityState !== "visible") return;
+
+    isApplying = true;
+    try {
+      if (mode === "auto") {
+        setAuto(player);
+        return;
+      }
+
+      let qualityToEnforce = null;
+
+      if (mode === "autoBest") qualityToEnforce = getBestQualityEntry(player)?.quality || null;
+      else if (mode === "autoSized") qualityToEnforce = getAutoSizedEntry(player)?.quality || null;
+      else if (mode === "fixed") qualityToEnforce = resolveFixedQualityToEnforce(player);
+
+      if (!qualityToEnforce) return;
+
+      setQualityPinned(player, qualityToEnforce);
+    } finally {
+      Promise.resolve().then(() => { isApplying = false; });
+    }
+  }
+
+  /* ================== hooks ================== */
+
+  function hookVideoElement() {
+    const video = D.querySelector("video");
+    if (!video || video === hookedVideoEl) return;
+
+    hookedVideoEl = video;
+
+    const onVideoSignal = (evtName) => scheduleReapplyBurst(`video:${evtName}`);
+
+    video.addEventListener("loadedmetadata", () => onVideoSignal("loadedmetadata"), { passive: true });
+    video.addEventListener("canplay",        () => onVideoSignal("canplay"), { passive: true });
+    video.addEventListener("playing",        () => onVideoSignal("playing"), { passive: true });
+  }
+
+  function hookResize(player) {
+    if (resizeObserver || !player) return;
+    if (!("ResizeObserver" in W)) return;
+
+    resizeObserver = new W.ResizeObserver(() => {
+      if (mode === "autoSized") {
+        clearReapplyTimeouts();
+        reapplyTimeouts.push(setTimeout(() => reapplyQuality("resize"), 120));
+      }
+    });
+
+    resizeObserver.observe(player);
+  }
+
+  function hookPlayerInternalEvents(player) {
+    if (playerEventsHooked || !player) return;
+    if (typeof player.addEventListener !== "function") return;
+
+    playerEventsHooked = true;
+
+    tryCall(() => player.addEventListener("onStateChange", () => {
+      scheduleReapplyBurst("player:onStateChange");
+    }));
+
+    tryCall(() => player.addEventListener("onPlaybackQualityChange", () => {
+      scheduleReapplyBurst("player:onPlaybackQualityChange");
+    }));
+  }
+
+  function hookSpaNavigation() {
+    W.addEventListener("yt-navigate-finish", () => {
+      const player = getPlayer();
+      refreshSupport(player, "yt-navigate-finish");
+      if (!isSupported) return;
+
+      hookVideoElement();
+      if (player) hookPlayerInternalEvents(player);
+      scheduleReapplyBurst("yt-navigate-finish");
+    }, { passive: true });
+
+    W.addEventListener("yt-page-data-updated", () => {
+      const player = getPlayer();
+      refreshSupport(player, "yt-page-data-updated");
+      if (!isSupported) return;
+
+      hookVideoElement();
+      scheduleReapplyBurst("yt-page-data-updated");
+    }, { passive: true });
+
+    D.addEventListener("visibilitychange", () => {
+      if (!isSupported) return;
+      if (D.visibilityState === "visible") scheduleReapplyBurst("visibilitychange");
+    }, { passive: true });
+
+    const mo = new MutationObserver(() => {
+      const player = getPlayer();
+      refreshSupport(player, "mutation");
+      if (!isSupported) return;
+
+      hookVideoElement();
+      if (player) {
+        hookResize(player);
+        hookPlayerInternalEvents(player);
+      }
+    });
+
+    mo.observe(D.body, { childList: true, subtree: true });
+
+    // Initial hook attempt
+    const player = getPlayer();
+    refreshSupport(player, "initial-hooks");
+    if (!isSupported) return;
+
+    hookVideoElement();
+    if (player) {
+      hookResize(player);
+      hookPlayerInternalEvents(player);
+    }
+  }
+
+  /* ================== UI ================== */
+
+  function inject() {
+    const bar = getPlayerBar();
+    const player = getPlayer();
+    if (!bar || !player) return;
+
+    refreshSupport(player, "inject");
+
+    // Restore once we have a player instance
+    restoreStateIfNeeded(player);
+
+    // Ensure hooks are installed once
+    if (!hasInjectedUI) {
+      hasInjectedUI = true;
+      hookSpaNavigation();
+      if (isSupported) scheduleReapplyBurst("initial");
+    }
+
+    if (bar.querySelector(".tm-hd-wrapper")) return;
+
+    const container = bar.querySelector(".middle-controls-buttons");
+    if (!container) return;
+
+    const wrapper = D.createElement("div");
+    wrapper.className = "tm-hd-wrapper";
+
+    const btn = D.createElement("button");
+    btn.textContent = "HD";
+    Object.assign(btn.style, {
+      background: "transparent",
+      border: "none",
+      cursor: "pointer",
+      fontSize: "14px",
+      fontWeight: "600",
+      padding: "4px 8px",
+      color: COLOR_GRAY
+    });
+
+    const menu = D.createElement("div");
+    Object.assign(menu.style, {
+      position: "fixed",
+      background: "var(--yt-spec-raised-background)",
+      borderRadius: "8px",
+      boxShadow: "0 4px 16px rgba(0,0,0,.3)",
+      display: "none",
+      zIndex: "2147483647",
+      padding: "6px 0",
+      minWidth: "260px",
+      fontFamily: MENU_FONT_FAMILY,
+      fontSize: MENU_FONT_SIZE,
+      lineHeight: MENU_LINE_HEIGHT
+    });
+
+    function buildAutoLabel(kind) {
+      if (kind === "autoBest") {
+        const best = getBestQualityEntry(player);
+        return "Auto Best Quality" + (best?.qualityLabel ? ` • ${best.qualityLabel}` : "");
+      }
+      if (kind === "autoSized") {
+        const sized = getAutoSizedEntry(player);
+        return "Auto Sized Quality" + (sized?.qualityLabel ? ` • ${sized.qualityLabel}` : "");
+      }
+      return "Auto";
+    }
+
+    function rebuildMenu() {
+      menu.innerHTML = "";
+
+      const playable = getPlayableQualities(player);
+      const hasManual = playable.some(q => q && q.isPlayable && q.quality !== "auto");
+
+      const manualItems = hasManual
+        ? sortQualities(playable)
+            .filter(q => q.quality !== "auto")
+            .map(q => ({ type: "quality", entry: q }))
+        : [];
+
+      const items = [
+        { type: "autoBest", label: buildAutoLabel("autoBest") },
+        { type: "autoSized", label: buildAutoLabel("autoSized") },
+        ...manualItems,
+        ...(manualItems.length ? [{ type: "divider" }] : []),
+        { type: "auto", label: "Auto" }
+      ];
+
+      items.forEach(item => {
+        if (item.type === "divider") {
+          const divider = D.createElement("div");
+          Object.assign(divider.style, {
+            height: "1px",
+            margin: "6px 0",
+            background: "rgba(255,255,255,.12)"
+          });
+          menu.appendChild(divider);
+          return;
+        }
+
+        const row = D.createElement("div");
+        Object.assign(row.style, {
+          padding: "10px 16px",
+          cursor: "pointer",
+          whiteSpace: "nowrap",
+          fontSize: MENU_FONT_SIZE,
+          lineHeight: MENU_LINE_HEIGHT,
+          letterSpacing: "0.2px",
+          transition: "background-color 120ms ease, color 120ms ease"
+        });
+
+        if (item.type === "quality") {
+          const codec = detectCodec(item.entry);
+          row.textContent = item.entry.qualityLabel + (codec ? ` • ${codec}` : "");
+        } else {
+          row.textContent = item.label;
+        }
+
+        const active = isMenuItemActive(item);
+        row.style.color = active ? MENU_TEXT_ACTIVE : MENU_TEXT_INACTIVE;
+        row.style.fontWeight = active ? "600" : "500";
+        row.style.boxShadow = active ? `inset 3px 0 0 ${MENU_ACTIVE_BAR}` : "none";
+
+        row.onmouseenter = () => { row.style.background = "rgba(255,255,255,.08)"; };
+        row.onmouseleave = () => { row.style.background = "transparent"; };
+
+        row.onclick = (e) => {
+          e.stopPropagation();
+          if (!isSupported) {
+            console.warn(`${PREFIX} click ignored: unsupported (${unsupportedReason || "unknown"})`);
+            menu.style.display = "none";
+            return;
+          }
+
+          if (item.type === "auto") applyAuto(player);
+          else if (item.type === "autoBest") applyAutoBest(player);
+          else if (item.type === "autoSized") applyAutoSized(player);
+          else applyFixed(player, item.entry);
+
+          updateButtonColor(btn);
+          updateButtonTitle(btn, player);
+          rebuildMenu();
+          menu.style.display = "none";
+        };
+
+        menu.appendChild(row);
+      });
+
+      updateButtonColor(btn);
+      updateButtonTitle(btn, player);
+    }
+
+    btn.onclick = (e) => {
+      e.stopPropagation();
+
+      refreshSupport(getPlayer(), "button-click");
+      if (!isSupported) {
+        console.warn(`${PREFIX} Extension no longer supported.`, {
+          reason: unsupportedReason || "unknown",
+          version: VERSION
+        });
+        return;
+      }
+
+      rebuildMenu();
+      const rect = btn.getBoundingClientRect();
+      menu.style.left = `${rect.left}px`;
+      menu.style.bottom = `${W.innerHeight - rect.top + 8}px`;
+      menu.style.display = (menu.style.display === "none") ? "block" : "none";
+    };
+
+    D.addEventListener("click", () => { menu.style.display = "none"; });
+
+    wrapper.appendChild(btn);
+    wrapper.appendChild(menu);
+    container.appendChild(wrapper);
+
+    updateButtonColor(btn);
+    updateButtonTitle(btn, player);
+  }
+
+  const observer = new MutationObserver(inject);
+  observer.observe(D.body, { childList: true, subtree: true });
+  inject();
+})();
