@@ -1,0 +1,20 @@
+// ==UserScript==
+// @name         Block Auto Fullscreen
+// @version      2025-12-17
+// @description  This script was created due to Azure auto full screen being annoying and no option to disable.
+// @author       Mainkill1
+// @match        https://*/*
+// @grant        none
+// ==/UserScript==
+
+Element.prototype.requestFullscreen = () => Promise.reject();
+
+document.addEventListener("fullscreenchange", () => {
+    if (document.fullscreenElement) {
+        document.exitFullscreen();
+    }
+});
+
+Element.prototype.requestFullscreen = function () {
+    return Promise.reject("Fullscreen blocked");
+};
