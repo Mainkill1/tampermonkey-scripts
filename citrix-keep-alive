@@ -1,0 +1,174 @@
+// ==UserScript==
+// @name         Citrix Keep Alive
+// @namespace    http://tampermonkey.net/
+// @version      2025-03-12
+// @description  Prevent auto logout on Citrix by saying tab is active and sending key events
+// @author       Mainkill1
+// @match        *://*/*
+// @grant        none
+// ==/UserScript==
+
+// ==UserScript==
+// @name         Citrix Keep Alive (Interaction Spoofing)
+// @namespace    http://tampermonkey.net/
+// @version      2.0
+// @description  Prevent Citrix from closing due to inactivity by randomly sending keypresses, and hiding tab view status.
+// @author       Your Name
+// @match        *://*/*
+// @grant        none
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    // If you properly set the url match setting then you do not need the function below. Was only added for the random user who comes across this script.
+    const isCitrix =
+        document.querySelector('meta[name="application-name"][content*="Citrix"]') ||
+        document.body.innerHTML.includes('Citrix') ||
+        window.location.pathname.toLowerCase().includes('citrix');
+
+    if (!isCitrix) {
+        return;
+    }
+    // End citrix detect
+
+    // === CONFIGURABLE SETTINGS ===
+    const ENABLE_ALWAYS = false; // Set to true to always run, false to use work hours
+    const WORK_HOURS = { start: 6, end: 17 }; // Work hours in 24-hour format (8 AM - 5 PM)
+    const MIN_DELAY = 10 * 1000; // Minimum delay between actions (5 seconds)
+    const MAX_DELAY = 25 * 1000; // Maximum delay between actions (1 minute)
+
+    let scriptEnabled = true; // Toggle status
+    let lastActivityTime = Date.now();
+
+    // === TOGGLE FUNCTION ===
+    function toggleScript() {
+        scriptEnabled = !scriptEnabled;
+        logWithTime(`Citrix Keep Alive script is now ${scriptEnabled ? "ENABLED" : "DISABLED"}`);
+    }
+
+    // === KEYBOARD SHORTCUT: Ctrl + Shift + K ===
+    document.addEventListener("keydown", function(event) {
+        if (event.ctrlKey && event.shiftKey && event.key === "K") {
+            toggleScript();
+        }
+    });
+
+    // === SPOOF TAB ACTIVITY ===
+    Object.defineProperty(document, "hidden", { value: false, configurable: true });
+    Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
+
+    document.addEventListener("visibilitychange", function(event) {
+        event.stopImmediatePropagation();
+    }, true);
+
+    // === SIMULATE KEY PRESSES ===
+    function sendRandomKeyPress() {
+        const keys = ["Shift", "Control", "ArrowUp", "ArrowDown", "Alt"];
+        const randomKey = keys[Math.floor(Math.random() * keys.length)];
+        let event = new KeyboardEvent("keydown", { key: randomKey, code: randomKey, bubbles: true });
+        document.dispatchEvent(event);
+        event = new KeyboardEvent("keyup", { key: randomKey, code: randomKey, bubbles: true });
+        document.dispatchEvent(event);
+        logWithTime(`Sent ${randomKey} key to prevent inactivity.`);
+    }
+
+    // === SIMULATE FOCUS ===
+    function spoofFocus() {
+        document.dispatchEvent(new Event("focus"));
+        document.dispatchEvent(new Event("blur"));
+        logWithTime("Spoofed focus and blur events.");
+    }
+
+    function resetTimer() {
+        lastActivityTime = Date.now();
+    }
+
+    function isWorkHours() {
+        let now = new Date();
+        let currentHour = now.getHours();
+        return currentHour >= WORK_HOURS.start && currentHour < WORK_HOURS.end;
+    }
+
+    function logWithTime(message) {
+    const now = new Date();// Get current date and time
+    const hours = now.getHours();
+    const minutes = now.getMinutes();
+    const seconds = now.getSeconds();
+    const formattedTime = `${hours % 12 || 12}:${minutes < 10 ? '0' : ''}${minutes}:${seconds} ${hours >= 12 ? 'PM' : 'AM'}`;
+    console.log(`[${formattedTime}] ${message}`);
+    }
+
+
+    function keepAliveLoop() {
+        let now = Date.now();
+        let inWorkHours = isWorkHours();
+
+        if (scriptEnabled && (ENABLE_ALWAYS || inWorkHours)) {
+            if (now - lastActivityTime > MIN_DELAY) {
+                let randomDelay = Math.floor(Math.random() * (MAX_DELAY - MIN_DELAY) + MIN_DELAY);
+                    sendRandomKeyPress();
+
+                logWithTime(`Next action in ${randomDelay / 1000} seconds.`);
+                setTimeout(keepAliveLoop, randomDelay);
+            } else {
+                setTimeout(keepAliveLoop, 5000);
+            }
+        } else {
+            console.log("Citrix Keep Alive script is paused.");
+            setTimeout(keepAliveLoop, 60000); // Check again in 1 minute
+        }
+    }
+
+    (function() {
+    // Override window.close() to block the tab from closing.
+        window.close = function() {
+            logWithTime("Attempt to close the window has been blocked.");
+        };
+    })();
+
+    (function() {
+
+        // Intercept setTimeout and setInterval to block auto-closure timers.
+        const originalSetTimeout = window.setTimeout;
+        const originalSetInterval = window.setInterval;
+
+        let loggedCallbacks = new Set();
+
+        // Intercept `setInterval` to log new callbacks
+        window.setInterval = function(callback, interval) {
+            // Check if the callback has been logged already
+            if (!loggedCallbacks.has(callback)) {
+                // If it's a new callback, log it and add it to the set
+                logWithTime(`New setInterval callback intercepted: ${callback}, ${interval}`)
+                //console.log(callback, interval);
+                loggedCallbacks.add(callback);
+            }
+
+            // Allow normal behavior of `setInterval`
+            return originalSetInterval(callback, interval);
+        };
+
+        // Optionally, intercept `setTimeout` similarly if needed
+        window.setTimeout = function(callback, delay) {
+            // Check if the callback has been logged already
+            if (!loggedCallbacks.has(callback)) {
+                // If it's a new callback, log it and add it to the set
+                logWithTime(`New setTimeout callback intercepted: ${callback}, ${delay}`);
+                loggedCallbacks.add(callback);////////////////////////////////////////////////////////////////////////////
+            }
+
+            // Allow normal behavior of `setTimeout`
+            return originalSetTimeout(callback, delay);////////////////////////////////////////////////////////////////////
+        };
+    })();
+
+
+    // === TRACK REAL USER ACTIVITY ===
+    document.addEventListener("mousemove", resetTimer);
+    document.addEventListener("keydown", resetTimer);
+
+    // === START SCRIPT ===
+    logWithTime("Citrix Keep Alive script loaded. Use Ctrl + Shift + K to toggle.");
+    keepAliveLoop();
+})();
