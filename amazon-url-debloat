@@ -1,0 +1,94 @@
+// ==UserScript==
+// @name         Debloat Amazon URLs
+// @namespace    https://tampermonkey.net/
+// @version      1.1
+// @description  Remove tracking/bloat from Amazon product URLs and page address bar
+// @match        https://www.amazon.com/*
+// @grant        none
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    const DP_REGEX = /\/dp\/([A-Z0-9]{10})/;
+
+    function buildCleanUrl(url) {
+        try {
+            const u = new URL(url);
+            const match = u.pathname.match(DP_REGEX);
+            if (!match) return null;
+
+            const asin = match[1];
+
+            // Preserve product slug if present
+            const slugMatch = u.pathname.split(`/dp/${asin}`)[0];
+
+            const slug = slugMatch && slugMatch !== '' ? slugMatch : '';
+            return `https://www.amazon.com${slug}/dp/${asin}/`;
+        } catch {
+            return null;
+        }
+    }
+
+    // --- Clean the address bar ---
+    function cleanCurrentPageUrl() {
+        const clean = buildCleanUrl(window.location.href);
+        if (clean && clean !== window.location.href) {
+            history.replaceState(null, '', clean);
+        }
+    }
+
+    // --- Clean all anchor tags ---
+    function cleanLinks(root = document) {
+        const links = root.querySelectorAll('a[href*="/dp/"]');
+        for (const link of links) {
+            const clean = buildCleanUrl(link.href);
+            if (clean && clean !== link.href) {
+                link.href = clean;
+            }
+        }
+    }
+
+    // Initial cleanup
+    cleanLinks();
+    cleanCurrentPageUrl();
+
+    // Observe DOM changes (Amazon injects content constantly)
+    const observer = new MutationObserver(mutations => {
+        for (const m of mutations) {
+            for (const node of m.addedNodes) {
+                if (node.nodeType === Node.ELEMENT_NODE) {
+                    cleanLinks(node);
+                }
+            }
+        }
+    });
+
+    observer.observe(document.body, {
+        childList: true,
+        subtree: true
+    });
+
+    // Hook SPA navigation (pushState / replaceState)
+    const _pushState = history.pushState;
+    const _replaceState = history.replaceState;
+
+    function hookHistory(method) {
+        return function () {
+            const result = method.apply(this, arguments);
+            setTimeout(() => {
+                cleanCurrentPageUrl();
+                cleanLinks();
+            }, 0);
+            return result;
+        };
+    }
+
+    history.pushState = hookHistory(_pushState);
+    history.replaceState = hookHistory(_replaceState);
+
+    window.addEventListener('popstate', () => {
+        cleanCurrentPageUrl();
+        cleanLinks();
+    });
+})();
